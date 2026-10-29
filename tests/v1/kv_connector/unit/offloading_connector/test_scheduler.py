@@ -230,8 +230,10 @@ def _make_partial_tail_scheduler(
     recurrent_only: bool = False,
     eagle: bool = False,
     cache_hit_alignment_tokens: int | None = 4,
+    async_scheduling: bool = False,
 ) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
+    vllm_config.scheduler_config.async_scheduling = async_scheduling
     vllm_config.cache_config.prefix_match_unit = None if recurrent_only else 4
     vllm_config.speculative_config = None
     vllm_config.kv_events_config = KVEventsConfig(
@@ -360,6 +362,39 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     assert recurrent_event.parent_block_hash is None
 
 
+def test_partial_tail_store_flushes_shared_scheduled_sources():
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler, request_id="source")
+    peer = _make_partial_tail_request(scheduler, request_id="peer")
+    peer.num_computed_tokens = 0
+    source_status = scheduler._req_status["source"]
+    source_status.group_states[0].block_ids[:] = [11, 12]
+    source_status.group_states[1].block_ids[:] = [0, 21]
+    peer_status = scheduler._req_status["peer"]
+    peer_status.group_states[0].block_ids[:] = [12]
+    peer_status.group_states[1].block_ids[:] = [99]
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"peer": 1}
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"source": [(1, 99, 28)]},
+    )
+    meta = scheduler.build_connector_meta(output)
+
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    [job_id] = meta.store_jobs
+    assert not meta.jobs_to_flush
+
+    next_meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    assert isinstance(next_meta, OffloadingConnectorMetadata)
+    assert next_meta.jobs_to_flush == {job_id}
+
+
 def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
     scheduler = _make_partial_tail_scheduler()
     _make_partial_tail_request(scheduler)
@@ -471,6 +506,134 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [11]
     assert src_spec.group_sizes == [1, 0]
+    [job_id] = jobs
+    assert scheduler._jobs[job_id].fenced_block_ids == [11]
+    assert scheduler._jobs[job_id].deferred_fence_block_ids == []
+    assert scheduler._block_id_to_pending_jobs == {11: {job_id}}
+
+
+def test_sync_finished_store_drops_before_same_step_reuse():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    request.num_computed_tokens = 0
+    request.is_finished.return_value = True
+    req_status = scheduler._req_status[request.request_id]
+    req_status.group_states[0].block_ids[:] = [11]
+    req_status.group_states[1].block_ids[:] = [99]
+    req_status.update_offload_keys()
+
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    scheduler.request_finished(request)
+
+    [job_id] = scheduler._pending_finished_store_jobs
+    assert scheduler._block_id_to_pending_jobs == {11: {job_id}}
+
+    output = SchedulerOutput.make_empty()
+    output.kv_cache_block_copies = [KVCacheBlockCopy(10, 11)]
+    meta = scheduler.build_connector_meta(output)
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert not meta.store_jobs
+    assert not meta.jobs_to_flush
+    assert job_id not in scheduler._jobs
+
+
+def test_async_finished_request_skips_final_store():
+    scheduler = _make_partial_tail_scheduler(async_scheduling=True)
+    source = _make_partial_tail_request(scheduler, request_id="source")
+    peer = _make_partial_tail_request(scheduler, request_id="peer")
+    for request in (source, peer):
+        request.num_computed_tokens = 0
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11]
+        req_status.group_states[1].block_ids[:] = [99]
+        req_status.update_offload_keys()
+    source.is_finished.return_value = True
+    peer.is_finished.return_value = False
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    scheduler.request_finished(source)
+
+    # The asynchronous scheduler may already have launched the next forward
+    # before request_finished runs. The final store is best-effort, so it is
+    # omitted instead of racing an already-launched write.
+    assert not scheduler._block_id_to_pending_jobs
+    _as_mock(scheduler.manager.prepare_store).assert_not_called()
+
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert not meta.store_jobs
+    assert not meta.jobs_to_flush
+
+
+def test_normal_store_flushes_for_existing_live_holder():
+    scheduler = _make_partial_tail_scheduler()
+    source = _make_partial_tail_request(scheduler, request_id="source")
+    peer = _make_partial_tail_request(scheduler, request_id="peer")
+    for request in (source, peer):
+        request.num_computed_tokens = 0
+        req_status = scheduler._req_status[request.request_id]
+        req_status.group_states[0].block_ids[:] = [11]
+        req_status.group_states[1].block_ids[:] = [99]
+        req_status.update_offload_keys()
+    source.is_finished.return_value = False
+    peer.is_finished.return_value = False
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {source.request_id: 16}
+    first_meta = scheduler.build_connector_meta(output)
+    assert isinstance(first_meta, OffloadingConnectorMetadata)
+    [job_id] = first_meta.store_jobs
+    # The peer already held the source before this step, so there is no new
+    # allocation to trigger the ordinary reuse scan. Detect the sharing while
+    # creating the store and wait at the next batch boundary, after submission.
+    assert not first_meta.jobs_to_flush
+    second_meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    assert isinstance(second_meta, OffloadingConnectorMetadata)
+    assert second_meta.jobs_to_flush == {job_id}
+
+
+def test_normal_store_flushes_before_shared_source_runs_again():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    peer = _make_partial_tail_request(scheduler, request_id="peer")
+    request.num_computed_tokens = 0
+    peer.num_computed_tokens = 0
+    request.is_finished.return_value = False
+    peer.is_finished.return_value = False
+    req_status = scheduler._req_status[request.request_id]
+    req_status.group_states[0].block_ids[:] = [11]
+    req_status.group_states[1].block_ids[:] = [99]
+    req_status.update_offload_keys()
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 16}
+    first_meta = scheduler.build_connector_meta(output)
+    assert isinstance(first_meta, OffloadingConnectorMetadata)
+    [job_id] = first_meta.store_jobs
+    assert not first_meta.jobs_to_flush
+
+    peer_status = scheduler._req_status[peer.request_id]
+    peer_status.group_states[0].block_ids[:] = [11]
+    peer_status.group_states[1].block_ids[:] = [100]
+
+    # No block is newly allocated on this step. The complete tables still
+    # identify the pending source as shared with a scheduled request.
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {peer.request_id: 1}
+    second_meta = scheduler.build_connector_meta(output)
+    assert isinstance(second_meta, OffloadingConnectorMetadata)
+    assert second_meta.jobs_to_flush == {job_id}
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
@@ -2357,16 +2520,14 @@ def test_on_request_finished_not_deferred_until_store_completion(
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_on_request_finished_fires_after_final_block_store(
-    request_runner, async_scheduling: bool
+def test_on_request_finished_omits_final_block_store(
+    request_runner, monkeypatch, async_scheduling: bool
 ):
-    """on_request_finished fires after the final prepare_store of the request.
+    """Finish-time stores respect the scheduler's submission ordering.
 
-    request_finished() keeps req_status alive so _build_store_jobs can retry a
-    block on the next step; the retry must be issued before the manager is told
-    the request is over. Every attempt made before the request finishes is
-    declined here, so the store that succeeds is the one from the finishing
-    step and the ordering has something to order.
+    Every attempt made before the request finishes is declined here. The
+    best-effort final tail is omitted in async mode, where a later forward may
+    already be running. Synchronous mode queues it while ownership is intact.
     """
     block_size = 4
     runner = request_runner(
@@ -2392,11 +2553,41 @@ def test_on_request_finished_fires_after_final_block_store(
 
     runner.manager.prepare_store.side_effect = prepare_store
 
-    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+    finish_snapshots: list[tuple[set[int], dict[int, set[int]]]] = []
+    original_request_finished = runner.connector_scheduler.request_finished
+
+    def capture_request_finished(request):
+        result = original_request_finished(request)
+        pending_jobs = runner.connector_scheduler._block_id_to_pending_jobs
+        finish_snapshots.append(
+            (
+                set(runner.connector_scheduler._pending_finished_store_jobs),
+                {block_id: set(job_ids) for block_id, job_ids in pending_jobs.items()},
+            )
+        )
+        return result
+
+    monkeypatch.setattr(
+        runner.connector_scheduler, "request_finished", capture_request_finished
+    )
+
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=() if async_scheduling else (0,),
+    )
 
     req_id = str(runner.req_id)
     assert calls.count(("on_request_finished", req_id)) == 1, calls
-    assert calls.count(("stored_after_finish", req_id)) == 1, calls
+    assert len(finish_snapshots) == 1
+    queued_jobs, fenced_blocks = finish_snapshots[0]
+    if async_scheduling:
+        assert calls.count(("stored_after_finish", req_id)) == 0, calls
+        assert not queued_jobs
+        assert not fenced_blocks
+    else:
+        assert calls.count(("stored_after_finish", req_id)) == 1, calls
+        assert len(queued_jobs) == 1
+        assert set().union(*fenced_blocks.values()) == queued_jobs
 
     finished_idx = calls.index(("on_request_finished", req_id))
     store_indices = [
@@ -3919,13 +4110,20 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     runner.manager.on_request_finished.side_effect = lambda req_context: (
         finalized.append(req_context.req_id)
     )
-    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
-        generate_store_output(keys)
-    )
 
     # Decode a couple of blocks and keep every transfer in flight, so the
-    # request has pending store jobs.
+    # request has a submitted store. Decline later running stores.
     runner.new_request(token_ids=[0] * tokens_per_chunk * 2)
+    accepted_running_store = False
+
+    def prepare_store(keys, req_context):
+        nonlocal accepted_running_store
+        if not accepted_running_store:
+            accepted_running_store = True
+            return generate_store_output(keys)
+        return None
+
+    runner.manager.prepare_store.side_effect = prepare_store
     runner.run(decoded_tokens=[0], complete_transfers=False)
     runner.run(
         decoded_tokens=[0] * (2 * tokens_per_chunk),
@@ -3938,18 +4136,22 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_status.transfer_jobs, "expected an in-flight store before finish"
     assert any(job.is_store for job in cs._jobs.values())
 
-    # Finish the request while its store is still in flight. The manager hook
-    # is deferred because the final store decision has not happened yet.
+    submitted_jobs = set(req_status.transfer_jobs)
+
+    # Finish the request while its store is still in flight. No new final store
+    # is created because the worker could submit it only after source release.
     req_status.req.status = RequestStatus.FINISHED_STOPPED
     cs.request_finished(req_status.req)
     assert finalized == []
     assert req_id in cs._req_status
+    assert set(req_status.transfer_jobs) == submitted_jobs
 
-    # reset_cache discards both the in-flight and not-yet-prepared final stores,
-    # so it issues the deferred notification before dropping the state.
+    # reset_cache flushes the jobs already submitted to workers.
     cs.reset_cache()
     assert finalized == [req_id]
     assert req_id not in cs._req_status
+    assert submitted_jobs == cs._current_batch_jobs_to_flush
+    assert submitted_jobs == set(cs._reset_fence)
 
 
 def test_pending_transfer_defers_prefix_lookup():
@@ -4979,12 +5181,12 @@ class TestEagle:
                 (1, 2),
             ),
         )
-        # Once the request finishes, no spec rejection can rewrite the tail,
-        # so the exclusion is lifted (issue #52735): the held-back (1, 3) and
-        # the just-completed block 4 are stored for both groups.
+        # Synchronous finish can safely lift the exclusion (issue #52735).
+        # Async finish may arrive after the next forward starts, so its
+        # best-effort final tail is omitted.
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
-            expected_stored=((1, 3),),
+            expected_stored=() if async_scheduling else ((1, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -5033,10 +5235,11 @@ class TestEagle:
             decoded_tokens=[1, 1, 1, 1],
             expected_stored=((0, 0), (0, 1), (0, 2)),
         )
-        # Finish lifts the exclusion; the tail block is stored (issue #52735).
+        # Synchronous finish lifts the exclusion (issue #52735). Async finish
+        # omits the best-effort tail because its next forward may have started.
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
-            expected_stored=((0, 3),),
+            expected_stored=() if async_scheduling else ((0, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -5223,6 +5426,14 @@ class TestEagle:
             segment_length = min(alignment_chunks, store_horizon_chunks - segment_start)
             if chunk % alignment_chunks >= segment_length - sliding_window_chunks:
                 expected_swa_chunks.append(chunk)
+        if abort_after_first_step and async_scheduling:
+            # Async finish cannot safely add the two chunks exposed only by
+            # the final partial-segment horizon.
+            expected_swa_chunks = [
+                chunk
+                for chunk in expected_swa_chunks
+                if chunk not in (store_horizon_chunks - 4, store_horizon_chunks - 3)
+            ]
         assert stored_swa_chunks == expected_swa_chunks
 
     @pytest.mark.skip_global_cleanup
@@ -5449,9 +5660,7 @@ class TestEagle:
 
 
 def test_request_finished_with_pending_stores_populates_fence(request_runner):
-    """When a request finishes with in-flight store jobs, the fence index
-    (_block_id_to_pending_jobs) is correctly populated with the store jobs'
-    deferred_fence_block_ids.
+    """An in-flight store keeps its source fenced after request completion.
 
     This prevents data corruption when a subsequent request reuses the same
     GPU blocks before the store completes.
@@ -5485,7 +5694,7 @@ def test_request_finished_with_pending_stores_populates_fence(request_runner):
         )
         for js in runner.connector_scheduler._jobs.values():
             if js.is_store:
-                job_block_ids.update(js.deferred_fence_block_ids or [])
+                job_block_ids.update(js.fenced_block_ids or [])
 
     # Run 1: create store job, finish request, populate fence.
     # With non-blocking drain (#45595), the job stays in-flight.
@@ -5500,7 +5709,7 @@ def test_request_finished_with_pending_stores_populates_fence(request_runner):
     populated_fence = next((f for f in fence_snapshots if len(f) > 0), None)
     assert populated_fence is not None, "Fence was never populated"
 
-    # Verify fence contained the job's non-SW block IDs.
+    # Verify fence contained the store source block IDs.
     for bid in job_block_ids:
         assert bid in populated_fence, f"Block {bid} not in fence: {populated_fence}"
 
@@ -5586,12 +5795,7 @@ def test_multiple_in_flight_stores_all_flushed_by_fence(request_runner):
 def test_request_finished_mixed_full_attn_and_sliding_window(
     request_runner,
 ):
-    """With both FullAttention and SlidingWindow groups, a single store job
-    has both deferred_fence_block_ids and fenced_block_ids.
-
-    request_finished only registers non-SW blocks in the fence.
-    SW blocks were already registered at store creation time.
-    """
+    """Both full-attention and sliding-window store sources stay fenced."""
     block_size = 4
     sliding_window = 8  # 2 blocks
 
@@ -5643,8 +5847,9 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
         )
         for js in runner.connector_scheduler._jobs.values():
             if js.is_store:
-                sw_block_ids.update(js.fenced_block_ids or [])
-                non_sw_block_ids.update(js.deferred_fence_block_ids or [])
+                ids = js.fenced_block_ids or []
+                non_sw_block_ids.update(ids[:1])
+                sw_block_ids.update(ids[1:])
 
     # Run 1: create store job, finish request, populate fence.
     runner.run(
@@ -5657,8 +5862,7 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     assert len(sw_block_ids) > 0, "No SW blocks in store job"
     assert len(non_sw_block_ids) > 0, "No non-SW blocks in store job"
 
-    # Find the fence snapshot where both SW and non-SW blocks were present.
-    # SW blocks should appear at creation time, non-SW at request_finished.
+    # Find the fence snapshot where both groups' sources were present.
     populated_fence = None
     for fence in fence_snapshots:
         has_sw = all(bid in fence for bid in sw_block_ids)
@@ -5681,7 +5885,7 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         expected_stored=((0, 0), (1, 0)),
-        expected_flushed=((1, 0),),
+        expected_flushed=((0, 0), (1, 0)),
     )
 
     # Verify fence is empty after full lifecycle (cleanup happened).
