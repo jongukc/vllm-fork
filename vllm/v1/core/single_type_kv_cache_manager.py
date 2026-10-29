@@ -996,7 +996,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
-            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
+            kv_cache_spec.sliding_window + kv_cache_spec.extra_retained_tokens,
+            kv_cache_spec.block_size,
+            drop_eagle_block
         )
 
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
@@ -1092,7 +1094,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         # Contiguous blocks a hit needs at a boundary (incl. the EAGLE peek).
         need = cls._contiguous_blocks_for_hit(
-            window_size=kv_cache_spec.sliding_window,
+            window_size=(
+                kv_cache_spec.sliding_window + kv_cache_spec.extra_retained_tokens
+            ),
             block_size=block_size,
             use_eagle=use_eagle,
         )
